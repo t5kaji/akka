@@ -14,8 +14,9 @@ import akka.persistence.typed.{ EventAdapter, NoOpEventAdapter }
 import akka.persistence.typed.internal.EventsourcedBehavior.{ InternalProtocol, WriterIdentity }
 import akka.persistence.typed.scaladsl._
 import akka.util.ConstantFun
-
 import scala.util.{ Failure, Success, Try }
+
+import akka.actor.typed.PostStop
 
 @InternalApi
 private[akka] object PersistentBehaviorImpl {
@@ -40,48 +41,50 @@ private[akka] final case class PersistentBehaviorImpl[Command, Event, State](
   snapshotPluginId:  Option[String]                                              = None,
   recoveryCompleted: (ActorContext[Command], State) ⇒ Unit                       = ConstantFun.scalaAnyTwoToUnit,
   tagger:            Event ⇒ Set[String]                                         = (_: Event) ⇒ Set.empty[String],
-  eventAdapter:      EventAdapter[Event, _]                                      = NoOpEventAdapter.instance[Event],
+  eventAdapter:      EventAdapter[Event, Any]                                    = NoOpEventAdapter.instance[Event],
   snapshotWhen:      (State, Event, Long) ⇒ Boolean                              = ConstantFun.scalaAnyThreeToFalse,
   recovery:          Recovery                                                    = Recovery(),
   onSnapshot:        (ActorContext[Command], SnapshotMetadata, Try[Done]) ⇒ Unit = PersistentBehaviorImpl.defaultOnSnapshot[Command] _
 ) extends PersistentBehavior[Command, Event, State] with EventsourcedStashReferenceManagement {
 
   override def apply(context: typed.ActorContext[Command]): Behavior[Command] = {
-    Behaviors.setup[EventsourcedBehavior.InternalProtocol] { ctx ⇒
-      Behaviors.withTimers { timers ⇒
-        val settings = EventsourcedSettings(ctx.system)
-        val internalStash = stashBuffer(settings)
-        Behaviors.tap(
-          onMessage = (_, _) ⇒ Unit,
-          onSignal = onSignalCleanup,
-          behavior = {
-            val setup = new EventsourcedSetup(
-              ctx,
-              timers,
-              persistenceId,
-              emptyState,
-              commandHandler,
-              eventHandler,
-              WriterIdentity.newIdentity(),
-              recoveryCompleted,
-              onSnapshot,
-              tagger,
-              eventAdapter,
-              snapshotWhen,
-              recovery,
-              holdingRecoveryPermit = false,
-              settings = settings,
-              internalStash = internalStash
-            )
+    Behaviors.setup[InternalProtocol] { ctx ⇒
+      val settings = EventsourcedSettings(ctx.system, journalPluginId.getOrElse(""), snapshotPluginId.getOrElse(""))
 
-            EventsourcedRequestingRecoveryPermit(setup)
-          }
-        )
-      }
+      val internalStash = stashBuffer(settings)
+
+      val eventsourcedSetup = new EventsourcedSetup(
+        ctx,
+        persistenceId,
+        emptyState,
+        commandHandler,
+        eventHandler,
+        WriterIdentity.newIdentity(),
+        recoveryCompleted,
+        onSnapshot,
+        tagger,
+        eventAdapter,
+        snapshotWhen,
+        recovery,
+        holdingRecoveryPermit = false,
+        settings = settings,
+        internalStash = internalStash
+      )
+
+      Behaviors.tap(EventsourcedRequestingRecoveryPermit(eventsourcedSetup))(
+        onMessage = (_, _) ⇒ Unit,
+        onSignal = {
+          case (_, PostStop) ⇒
+            eventsourcedSetup.cancelRecoveryTimer()
+            clearStashBuffer()
+          case _ ⇒
+        })
+
     }.widen[Any] {
       case res: JournalProtocol.Response           ⇒ InternalProtocol.JournalResponse(res)
       case res: SnapshotProtocol.Response          ⇒ InternalProtocol.SnapshotterResponse(res)
       case RecoveryPermitter.RecoveryPermitGranted ⇒ InternalProtocol.RecoveryPermitGranted
+      case internal: InternalProtocol              ⇒ internal // such as RecoveryTickEvent
       case cmd: Command @unchecked                 ⇒ InternalProtocol.IncomingCommand(cmd)
     }.narrow[Command]
   }
@@ -152,7 +155,7 @@ private[akka] final case class PersistentBehaviorImpl[Command, Event, State](
    * the journal understands
    */
   def eventAdapter(adapter: EventAdapter[Event, _]): PersistentBehavior[Command, Event, State] =
-    copy(eventAdapter = adapter)
+    copy(eventAdapter = adapter.asInstanceOf[EventAdapter[Event, Any]])
 
   /**
    * The `callback` function is called to notify the actor that a snapshot has finished
