@@ -4,6 +4,8 @@
 
 syntax = "proto2";
 
+package akka;
+
 option java_package = "akka.persistence.serialization";
 option optimize_for = SPEED;
 
